@@ -1,7 +1,7 @@
 """
 Service Module - Yolly AI
 Integrates with Yolly.ai service.
-Uses od2.in temp mail for on-the-fly account registration and verification.
+Uses fakemail.net temp mail for on-the-fly account registration and verification.
 Saves created accounts directly to the database.
 """
 import os
@@ -15,6 +15,13 @@ import atexit
 import requests
 from concurrent.futures import ThreadPoolExecutor
 import database as db
+
+try:
+    from bs4 import BeautifulSoup
+    _HAS_BS4 = True
+except Exception:
+    BeautifulSoup = None
+    _HAS_BS4 = False
 
 # Graceful shutdown event
 _shutdown_event = threading.Event()
@@ -187,10 +194,12 @@ AVAILABLE_MODELS = {
 # Proxy settings
 PROXYSCRAPE_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
 
+
 def get_available_models(mode=None):
     if mode:
         return AVAILABLE_MODELS.get(mode, [])
     return AVAILABLE_MODELS
+
 
 # --- Proxy Crawl & Test Helpers ---
 
@@ -205,6 +214,7 @@ def fetch_proxies() -> list:
         print(f"[-] Proxy scraping failed: {e}")
     return []
 
+
 def test_proxy(proxy_url: str, timeout: int = 5) -> bool:
     try:
         proxies = {"http": proxy_url, "https": proxy_url}
@@ -212,6 +222,7 @@ def test_proxy(proxy_url: str, timeout: int = 5) -> bool:
         return r.status_code < 500
     except Exception:
         return False
+
 
 def find_working_proxy(max_workers: int = 30) -> str:
     proxy_list = fetch_proxies()
@@ -239,6 +250,7 @@ def find_working_proxy(max_workers: int = 30) -> str:
     except queue.Empty:
         return None
 
+
 # --- Session & Temp Mail helpers ---
 
 def make_session():
@@ -252,18 +264,137 @@ def make_session():
     })
     return s
 
+
+FAKEMAIL_BASE = "https://www.fakemail.net"
+
+
+def make_mail_session():
+    """Creates a fakemail.net session and returns (session, email).
+    The mailbox is bound to the session cookies, so the session must be reused
+    while polling for the verification message.
+    """
+    ms = requests.Session()
+    ms.headers.update({
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "accept-language": "tr-TR,tr;q=0.9",
+        "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    })
+
+    try:
+        html = ms.get(f"{FAKEMAIL_BASE}/", timeout=20).text
+        m = re.search(r'const CSRF="([a-f0-9]+)"', html)
+        if not m:
+            print("[-] fakemail CSRF token not found.")
+            return None, None
+        csrf_token = m.group(1)
+
+        ms.headers.update({
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "x-requested-with": "XMLHttpRequest",
+            "referer": f"{FAKEMAIL_BASE}/",
+        })
+
+        res = ms.get(f"{FAKEMAIL_BASE}/index/index", params={"csrf_token": csrf_token}, timeout=20)
+        data = json.loads(res.content.decode("utf-8-sig"))
+        email = data.get("email")
+        if not email:
+            print("[-] fakemail address could not be obtained.")
+            return None, None
+        return ms, email
+    except Exception as e:
+        print(f"[-] Temp mail creation failed: {e}")
+        return None, None
+
+
+def _extract_code_from_html(mail_html: str):
+    """Extracts a 4-8 digit verification code from a fakemail message body."""
+    if _HAS_BS4:
+        try:
+            soup = BeautifulSoup(mail_html, "html.parser")
+            for p in soup.find_all("p"):
+                text = p.get_text(strip=True)
+                if re.fullmatch(r"\d{4,8}", text):
+                    return text
+            plain = soup.get_text(" ", strip=True)
+        except Exception:
+            plain = re.sub(r"<[^>]+>", " ", mail_html)
+    else:
+        plain = re.sub(r"<[^>]+>", " ", mail_html)
+
+    otp = re.search(r"\b(\d{6})\b", plain)
+    if otp:
+        return otp.group(1)
+    otp = re.search(r"\b(\d{4,8})\b", plain)
+    if otp:
+        return otp.group(1)
+    return None
+
+
+def poll_temp_mail_code(mail_session, attempts: int = 25, delay: int = 2):
+    """Polls the fakemail inbox until a Yolly verification code arrives."""
+    seen_ids = set()
+    for _ in range(attempts):
+        if _shutdown_event.wait(delay):
+            return None
+        try:
+            refresh = mail_session.get(f"{FAKEMAIL_BASE}/index/refresh", timeout=20)
+            if refresh.status_code != 200:
+                continue
+            messages = json.loads(refresh.content.decode("utf-8-sig"))
+            if not isinstance(messages, list):
+                continue
+
+            for msg in messages:
+                msg_id = msg.get("id")
+                if not msg_id or msg_id in seen_ids:
+                    continue
+                seen_ids.add(msg_id)
+
+                subject = (msg.get("predmet") or "").lower()
+                sender = (msg.get("od") or msg.get("from") or "").lower()
+
+                mail_html = mail_session.get(f"{FAKEMAIL_BASE}/email/id/{msg_id}", timeout=20).text
+                code = _extract_code_from_html(mail_html)
+                if not code:
+                    continue
+
+                if ("yolly" in subject or "verification" in subject
+                        or "yolly" in sender or "verification" in sender):
+                    return code
+                # Fallback: single-message inbox with a valid looking code
+                if len(code) == 6:
+                    return code
+        except Exception as e:
+            print(f"[!] Email poll exception: {e}")
+    return None
+
+
 def create_yolly_account(api_key_id):
     """Creates a new Yolly.ai account dynamically on-the-fly.
-    Uses od2.in for temp mail. Saves account to database.
+    Uses fakemail.net for temp mail. Saves account to database.
     """
-    box = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    email = f"{box}@tm.od2.in"
+    mail_session, email = make_mail_session()
+    if not mail_session or not email:
+        return None, None
+
+    print(f"[*] Temp mail created: {email}")
 
     s = make_session()
 
     # 1. send-code
     send_code_url = "https://www.yolly.ai/api/auth/send-code"
-    
+
     use_proxy = False
     try:
         res = s.post(send_code_url, json={"email": email}, timeout=15)
@@ -277,7 +408,7 @@ def create_yolly_account(api_key_id):
                     is_rate_limited = True
             except Exception:
                 pass
-        
+
         if is_rate_limited:
             use_proxy = True
     except Exception as e:
@@ -300,38 +431,7 @@ def create_yolly_account(api_key_id):
         print("[+] send-code successful without proxy.")
 
     # 2. Poll temp mail for OTP code
-    code = None
-    for _ in range(25): # poll for ~50 seconds
-        time.sleep(2)
-        try:
-            inbox_r = requests.get(
-                "https://od2.in/api/get-email",
-                params={"id": box},
-                headers={"user-agent": "Mozilla/5.0"},
-                timeout=15
-            )
-            if inbox_r.status_code == 200:
-                inbox = inbox_r.json()
-                if inbox:
-                    msg_r = requests.get(
-                        "https://od2.in/api/get-email",
-                        params={"emailId": inbox[0]["_id"]},
-                        headers={"user-agent": "Mozilla/5.0"},
-                        timeout=15
-                    )
-                    if msg_r.status_code == 200:
-                        msg = msg_r.json()
-                        text = (msg.get("text") or "") + "\n" + (msg.get("html") or "")
-                        subject = (msg.get("subject") or "").lower()
-                        sender = (msg.get("from", {}).get("text") or "").lower()
-
-                        if "yolly" in subject or "verification" in subject or "yolly" in sender or "verification" in sender:
-                            otp = re.search(r"\b(\d{6})\b", text)
-                            if otp:
-                                code = otp.group(1)
-                                break
-        except Exception as e:
-            print(f"[!] Email poll exception: {e}")
+    code = poll_temp_mail_code(mail_session, attempts=25, delay=2)
 
     if not code:
         print("[-] Verification OTP code not received.")
@@ -405,6 +505,7 @@ def create_yolly_account(api_key_id):
 
     return s, email
 
+
 def link_new_account_to_task(api_key_id, email, task_id):
     """Updates database:
     1. Marks the newly registered on-the-fly email as used = 1.
@@ -428,7 +529,7 @@ def link_new_account_to_task(api_key_id, email, task_id):
                 'UPDATE accounts SET used = 1 WHERE api_key_id = ? AND email = ?',
                 (api_key_id, email)
             )
-        
+
         # 2. Find a random unused account for this client
         if db.DB_TYPE == 'postgresql':
             cursor.execute(
@@ -440,7 +541,7 @@ def link_new_account_to_task(api_key_id, email, task_id):
                 'SELECT email FROM accounts WHERE api_key_id = ? AND used = 0 AND email != ?',
                 (api_key_id, email)
             )
-        
+
         rows = cursor.fetchall()
         if rows:
             emails = []
@@ -451,11 +552,11 @@ def link_new_account_to_task(api_key_id, email, task_id):
                     emails.append(r[0])
                 else:
                     emails.append(r['email'])
-            
+
             if emails:
                 chosen_email = random.choice(emails)
                 print(f"[QUOTA] Consuming random unused account to decrease client quota: {chosen_email}")
-                
+
                 # 3. Mark the chosen random account as used = 1
                 if db.DB_TYPE == 'postgresql':
                     cursor.execute(
@@ -489,6 +590,7 @@ def link_new_account_to_task(api_key_id, email, task_id):
         conn.close()
     return consumed_email
 
+
 def login_with_retry_and_link(api_key_id, task_id=None):
     """On-the-fly registration wrapper. Tries creating a Yolly account up to 5 times.
     Links the successful account to the task.
@@ -500,22 +602,23 @@ def login_with_retry_and_link(api_key_id, task_id=None):
             return session, {"email": consumed_email}
     return None, None
 
+
 def upload_image_to_yolly_b64(session, b64_data, filename_ext=".png"):
     """Parses base64 image data and uploads it to Yolly."""
     if "," in b64_data:
         b64_data = b64_data.split(",")[1]
-    
+
     mime_type = "image/png" if filename_ext == ".png" else "image/jpeg"
     base64_string = f"data:{mime_type};base64,{b64_data}"
-    
+
     timestamp = int(time.time() * 1000)
     file_name = f"video-input-{timestamp}-0{filename_ext}"
-    
+
     upload_url = "https://www.yolly.ai/api/kie/upload"
     payload = {"base64Data": base64_string, "fileName": file_name}
-    
+
     session.headers.update({"referer": "https://www.yolly.ai/video"})
-    
+
     try:
         res = session.post(upload_url, json=payload, timeout=30)
         if res.status_code == 200:
@@ -527,27 +630,27 @@ def upload_image_to_yolly_b64(session, b64_data, filename_ext=".png"):
         print(f"[-] Image upload network error: {e}")
     return None
 
+
 # --- Worker Functions ---
 
 def process_image_task(task_id, params, api_key_id):
     try:
         db.update_task_status(task_id, 'running')
-        
+
         session, account = login_with_retry_and_link(api_key_id, task_id)
         if not session:
             db.update_task_status(task_id, 'failed')
             db.add_task_log(task_id, "Service temporarily unavailable.")
             return
-        
 
         prompt = params.get('prompt', '')
         model = params.get('model', 'nano-banana-2')
         aspect_ratio = params.get('size', '1:1')
         resolution = params.get('resolution', '1k')
-        
+
         input_mode = "text"
         reference_images = []
-        
+
         images = params.get('reference_images', [])
         if images:
             input_mode = "image"
@@ -648,26 +751,26 @@ def process_image_task(task_id, params, api_key_id):
         if 'account' in locals() and account:
             db.release_account(api_key_id, account['email'])
 
+
 def process_video_task(task_id, params, api_key_id):
     try:
         db.update_task_status(task_id, 'running')
-        
+
         session, account = login_with_retry_and_link(api_key_id, task_id)
         if not session:
             db.update_task_status(task_id, 'failed')
             db.add_task_log(task_id, "Service temporarily unavailable.")
             return
-        
 
         prompt = params.get('prompt', '')
         model = params.get('model', 'grok-imagine')
         aspect_ratio = params.get('size', '16:9')
         resolution = params.get('resolution', '480p')
         duration = str(params.get('duration', '6'))
-        
+
         input_mode = "text"
         images_payload = []
-        
+
         start_frame_b64 = params.get('start_frame')
         if start_frame_b64:
             input_mode = "image"
@@ -787,16 +890,20 @@ def process_video_task(task_id, params, api_key_id):
         if 'account' in locals() and account:
             db.release_account(api_key_id, account['email'])
 
+
 def process_tts_task(task_id, params, api_key_id):
     db.update_task_status(task_id, 'failed')
     db.add_task_log(task_id, "TTS is not supported by this service.")
+
 
 def process_music_task(task_id, params, api_key_id):
     db.update_task_status(task_id, 'failed')
     db.add_task_log(task_id, "Music is not supported by this service.")
 
+
 def get_tts_voices(api_key_id):
     return [], "TTS not supported by this service"
+
 
 def proxy_request(url, range_header=None):
     """Proxy implementation for Yolly."""
@@ -810,6 +917,7 @@ def proxy_request(url, range_header=None):
     resp_headers = [(k, v) for k, v in r.headers.items() if k.lower() not in excluded]
     return r.iter_content(chunk_size=8192), r.status_code, resp_headers
 
+
 # --- Recovery Logic ---
 
 def check_yolly_for_task(task_id, mode, token_cookies, api_task_id, account_email=None, api_key_id=None):
@@ -818,7 +926,7 @@ def check_yolly_for_task(task_id, mode, token_cookies, api_task_id, account_emai
         cookie_dict = json.loads(token_cookies)
         session = make_session()
         requests.utils.cookiejar_from_dict(cookie_dict, session.cookies)
-        
+
         if mode == 'image':
             query_url = "https://www.yolly.ai/api/image/query"
             q_res = session.get(query_url, params={"id": api_task_id}, timeout=15)
@@ -842,7 +950,7 @@ def check_yolly_for_task(task_id, mode, token_cookies, api_task_id, account_emai
         elif mode == 'video':
             task_data = db.get_task(api_key_id, task_id) if api_key_id else None
             provider = task_data.get('model', 'grok-imagine') if task_data else 'grok-imagine'
-            
+
             query_url = "https://www.yolly.ai/api/video/query"
             q_res = session.get(query_url, params={"id": api_task_id, "provider": provider}, timeout=15)
             if q_res.status_code == 200:
@@ -860,19 +968,20 @@ def check_yolly_for_task(task_id, mode, token_cookies, api_task_id, account_emai
                         db.release_account(api_key_id, account_email)
                     return
             threading.Thread(target=poll_video_recovery, args=(task_id, api_task_id, token_cookies, provider, account_email, api_key_id)).start()
-            
+
     except Exception as e:
         print(f"[-] Recovery check exception: {e}")
         db.update_task_status(task_id, 'failed')
         if account_email and api_key_id:
             db.release_account(api_key_id, account_email)
 
+
 def poll_image_recovery(task_id, api_task_id, token_cookies, account_email=None, api_key_id=None):
     try:
         cookie_dict = json.loads(token_cookies)
         session = make_session()
         requests.utils.cookiejar_from_dict(cookie_dict, session.cookies)
-        
+
         query_url = "https://www.yolly.ai/api/image/query"
         q_params = {"id": api_task_id}
 
@@ -906,12 +1015,13 @@ def poll_image_recovery(task_id, api_task_id, token_cookies, account_email=None,
         if account_email and api_key_id:
             db.release_account(api_key_id, account_email)
 
+
 def poll_video_recovery(task_id, api_task_id, token_cookies, provider='grok-imagine', account_email=None, api_key_id=None):
     try:
         cookie_dict = json.loads(token_cookies)
         session = make_session()
         requests.utils.cookiejar_from_dict(cookie_dict, session.cookies)
-        
+
         query_url = "https://www.yolly.ai/api/video/query"
         q_params = {"id": api_task_id, "provider": provider}
 
@@ -944,6 +1054,7 @@ def poll_video_recovery(task_id, api_task_id, token_cookies, provider='grok-imag
         if account_email and api_key_id:
             db.release_account(api_key_id, account_email)
 
+
 def resume_incomplete_tasks():
     print("=" * 50)
     print("[STARTUP] Starting crash recovery for AI service...")
@@ -954,7 +1065,7 @@ def resume_incomplete_tasks():
     except Exception as e:
         print(f"[STARTUP] Error during stale task recovery: {e}")
         recovery_result = {'needs_check': []}
-    
+
     needs_check = recovery_result.get('needs_check', [])
     for t in needs_check:
         if t.get('token') and t.get('external_task_id'):
@@ -966,7 +1077,7 @@ def resume_incomplete_tasks():
             db.update_task_status(t['task_id'], 'failed')
             if t.get('account_email') and t.get('api_key_id'):
                 db.release_account(t['api_key_id'], t['account_email'])
-                
+
     try:
         tasks = db.get_incomplete_tasks()
         for t in tasks:
@@ -977,7 +1088,7 @@ def resume_incomplete_tasks():
                 token = t['token']
                 account_email = t.get('account_email')
                 api_key_id = t.get('api_key_id')
-                
+
                 print(f"  [RESUME] Task {task_id} ({mode}) - External ID: {external_id}")
                 if mode == 'image':
                     threading.Thread(
