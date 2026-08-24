@@ -530,4 +530,3 @@ def delete_account(email):
         return jsonify({"message": f"Account {email} deleted"})
     else:
         return jsonify({"error": "Account not found"}), 404
-    app.run(host='127.0.0.1', port=5000, debug=False)
